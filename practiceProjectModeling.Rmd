@@ -1,0 +1,257 @@
+---
+title: "Modeling Assignment"
+author: "Nick Goshev, Chris Joyce, Tommaso Pascucci"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+editor_options: 
+  chunk_output_type: inline
+---
+# setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(tidyverse)
+library(C50)
+library(caret)
+library(rminer)
+library(knitr)
+library(rpart)
+library(rpart.plot)
+library(e1071)
+library(ggplot2)
+library(kernlab)
+library(matrixStats)
+library(RWeka)
+library(psych)
+library(randomForest)
+
+
+
+
+
+```
+# Data preparation
+
+```{r}
+df <- read.csv("application_train.csv",stringsAsFactors = TRUE)
+head(df)
+df <- df[,-1]
+```
+
+## chi2 testing to remove variables with low association with target
+```{r}
+
+to_remove <- c()
+
+for(index in c(2:121)){
+  
+contingency_table <- table(df[,1], df[,index])
+  
+chi_test <- chisq.test(contingency_table)
+
+  if(chi_test$p.value > 0.01){
+    to_remove <- c(to_remove, index)
+  }
+}
+
+df_filtered <- df[,-to_remove]
+```
+
+
+## examining null data and removing columns with extremely high null percentages 
+
+```{r}
+total <- colSums(is.na(df_filtered))
+
+# Calculate the percentage of missing values for each column
+percent <- (colSums(is.na(df_filtered)) / nrow(df_filtered)) * 100
+
+# Combine total and percent into a data frame
+missing_application_train_data <- data.frame(Total = total,Percent = percent)
+
+
+missing_application_train_data <- missing_application_train_data[order(-missing_application_train_data$Total), ]
+
+print(missing_application_train_data)
+
+kept <- missing_application_train_data %>% filter(Percent < 20) %>% select() %>% labels()
+
+kept <- unlist(kept[[1]])
+
+df_filtered <- df[,kept] %>% mutate(TARGET=df$TARGET)
+```
+
+## factoring binary columns
+```{r}
+df_filtered %>% summary()
+
+
+unique_counts <- sort(lengths(lapply(df_filtered, unique)))
+binary_columns <- names(unique_counts[unique_counts==2])
+
+df_filtered[binary_columns] <- lapply(df_filtered[binary_columns], factor)
+```
+
+## removing columns with extremely high correlations amongst each other
+```{r}
+corr_matrix <- cor(df_filtered %>% select(where(is.numeric)), use = "pairwise.complete.obs")
+
+high_corr <- findCorrelation(corr_matrix, cutoff = 0.95)
+
+df_filtered <- df_filtered[,-high_corr]
+```
+
+## imputing the missing data for the remaining columns using multiple imputation
+```{r}
+library(mice)
+
+imputed_data <- mice(df_filtered, m = 5, maxit = 5, seed = 500, ridge = 0.1)
+
+df_imputed <- complete(imputed_data)
+
+sum(is.na(df_imputed))
+
+```
+
+
+
+# modeling
+
+```{r}
+df <- read.csv("PracticeProjectImputed.csv",stringsAsFactors = TRUE)
+df$TARGET <- df$TARGET %>% factor()
+df %>% head()
+```
+### train/test split
+```{r}
+set.seed(100)
+inTrain <- createDataPartition(df$TARGET, p=0.7, list=FALSE)
+
+df_train <- df[inTrain,]
+df_test <- df[-inTrain,]
+
+```
+
+## Random Forest
+col 38 is being excluded here due to having 58 levels, random forest does not work with categorical variables over 53 unique levels.
+### default
+```{r}
+
+rf_default <- randomForest(TARGET ~ ., data = df_train[,-38])
+
+predictions_train <- predict(rf_default,df_train)
+predictions_test <- predict(rf_default,df_test)
+
+```
+
+```{r}
+
+mmetric(df_train$TARGET, predictions_train, metric=c("ACC","TPR","PRECISION","F1"))
+
+mmetric(df_test$TARGET, predictions_test, metric=c("ACC","TPR","PRECISION","F1"))
+```
+although the performance was relatively good on the train set the default model is grossly overfit, and not likely to generalize well. We should adjust hyperparameters to attempt to reconcile this gap between the train and test performance. Also the true positive rate for class 2 is alarmingly low in this case.
+### larger terminal nodes
+```{r}
+rf_bignodes <- randomForest(TARGET ~ ., data = df_train, nodesize=200)
+predictions_train <- predict(rf_bignodes,df_train)
+predictions_test <- predict(rf_bignodes,df_test)
+```
+these adjustments were done to attempt to reduce overfitting of the model by ensuring a large number of observations in each node.
+```{r}
+
+mmetric(df_train$TARGET, predictions_train, metric=c("ACC","TPR","PRECISION","F1"))
+
+mmetric(df_test$TARGET, predictions_test, metric=c("ACC","TPR","PRECISION","F1"))
+```
+very similar performance on test set, but slightly lowered on train, the accuracy for train and test was extremely similar which indicates that the model generalizes well. However it appears to be guessing as a majority classifier, which is not very beneficial, we want to be able to capture observations from both classes.
+
+#### changed thresholds with big nodesize
+```{r}
+rf_bignodes <- randomForest(TARGET ~ ., data = df_train[,-38], nodesize=200, cutoff=c(0.92,0.08) )
+predictions_train <- predict(rf_bignodes,df_train)
+predictions_test <- predict(rf_bignodes,df_test)
+```
+the threshhold was changed to 0.08 as that is very close to the proportion of observations that are class 2, we want to retain the high nodesize to increase the probability of capturing class 2 as it is very rare. At a threshold of 0.8 that indicates that if the node has class 2 at a higher rate than average it may be at risk and should be classified as such in an attempt to increase true positive rate of class 2.
+
+```{r}
+
+mmetric(df_train$TARGET, predictions_train, metric=c("ACC","TPR","PRECISION","F1"))
+
+mmetric(df_test$TARGET, predictions_test, metric=c("ACC","TPR","PRECISION","F1"))
+```
+The accuracy for the train set and test set is much closer than that of the default tree while still remaining competitive with the testing default. This parameter adjustment had the added benefit of having a much higher tpr for class 2 but it is still very low at 6.4%.
+
+### Lowering tree depth
+```{r}
+rf_bignodes <- randomForest(TARGET ~ ., data = df_train[,-38], maxnodes=50)
+predictions_train <- predict(rf_bignodes,df_train)
+predictions_test <- predict(rf_bignodes,df_test)
+```
+Another way to attempt to address the overfitting is by lowering the depth of the trees. Ideally this will also result in a better true positive rate than the increased node size as well.
+```{r}
+
+mmetric(df_train$TARGET, predictions_train, metric=c("ACC","TPR","PRECISION","F1"))
+
+mmetric(df_test$TARGET, predictions_test, metric=c("ACC","TPR","PRECISION","F1"))
+```
+Similarly to the original larger noded model this is essentially acting as a majority classifier, I will try adding the thresholding here as well to see if I can increase the TPR2.
+
+#### lowering threshold for class 2
+
+```{r}
+rf_bignodes <- randomForest(TARGET ~ ., data = df_train[,-38], maxnodes=50, cutoff=c(0.92,0.08) )
+predictions_train <- predict(rf_bignodes,df_train)
+predictions_test <- predict(rf_bignodes,df_test)
+```
+
+```{r}
+
+mmetric(df_train$TARGET, predictions_train, metric=c("ACC","TPR","PRECISION","F1"))
+
+mmetric(df_test$TARGET, predictions_test, metric=c("ACC","TPR","PRECISION","F1"))
+```
+Even with implementing such drastic thresholds this iteration of the model is still classifying as a majority classifier, I believe the way to rectify this would be to increase the maxnodes count.
+
+### observations
+I believe the big node forest with thresholding is the best way so far for predicting. The accuracy rates are close to the majority classifier, which is already at a very high >90%, while also sporting the highest true positive rate for class 2 by a large margin. In future tests I plan to experiment with reducing features per tree and adding weighting as the next steps to reduce overfitting and to increase TPR2
+#### variable importance within rf
+```{r}
+varImp(rf_default) %>% arrange(desc(Overall))
+  
+sortImp(rf_default)
+
+
+df$TARGET %>% plot()
+
+`````````
+it looks like the most important variables by a large margin are the external source normalization scores which refer to risk of the observation.
+
+```{r}
+cm <- confusionMatrix(predictions_test, df_test$TARGET)
+
+rf_cm <- as.data.frame(cm$table)
+
+colnames(rf_cm) <- c("Prediction", "Reference", "Freq")
+
+ggplot(data=rf_cm, aes(x=Reference, y=Prediction, fill = Freq))+
+  geom_tile()+
+  geom_text(aes(label=Freq),vjust=1)+
+  scale_fill_gradient(low="white", high="blue")+
+  labs(title = "RF Test Matrix", x="Actual", y= "Prediceted")+
+  theme_minimal()
+```
+
+```{r}
+model <- c("Random Forest", "Naive Bayes", "XGBoost")
+Accuracy <- c(91.76, 65.5, 91.98)
+
+varImp(rf_bignodes) %>% arrange(desc(Overall))
+
+```
+
+
